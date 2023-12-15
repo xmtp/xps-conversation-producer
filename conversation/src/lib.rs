@@ -1,11 +1,10 @@
-use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc};
 
 use anyhow::Error;
 use ethers::{
     contract::abigen,
     core::k256::ecdsa::SigningKey,
-    prelude::{EthEvent, LocalWallet, Provider, SignerMiddleware, Wallet},
+    prelude::{LocalWallet, Provider, SignerMiddleware, Wallet},
     providers::{Middleware, StreamExt, Ws},
     types::{Address, Bytes, Filter, H160, H256, U256, U64},
 };
@@ -29,16 +28,16 @@ abigen!(
     derives(serde::Deserialize, serde::Serialize)
 );
 
-#[derive(Debug, Clone, Serialize, Deserialize, EthEvent)]
-pub struct PayloadSent {
-    pub conversation_id: [u8; 32],
-    pub message: String,
-    pub prev_change: U256,
+/// Rewind: A struct to hold the message and the last change block.
+pub struct MessageRewind {
+    pub message: Vec<String>,
+    pub last_change: U256,
 }
 
+/// MessageSender: A struct to send messages to the XPS Sender contract.
 pub struct MessageSender {
     contract: XPSSender<Client>,
-    signer: Arc<Client>,
+    client: Arc<Client>,
 }
 
 impl MessageSender {
@@ -56,12 +55,12 @@ impl MessageSender {
             let middleware = SignerMiddleware::new_with_provider_chain(provider, wallet)
                 .await
                 .unwrap();
-            let signer = Arc::new(middleware);
+            let client = Arc::new(middleware);
             tracing::info!("Contract Connected: {sender_address}");
             let sender_address = H160::from_str(sender_address).unwrap();
-            let contract = XPSSender::new(sender_address, signer.clone());
+            let contract = XPSSender::new(sender_address, client.clone());
 
-            Ok(Self { contract, signer })
+            Ok(Self { contract, client })
         } else {
             let err = wallet_result.unwrap_err();
             tracing::error!("Wallet error: {:?}", err);
@@ -93,13 +92,12 @@ impl MessageSender {
         Ok(())
     }
 
-    pub async fn last_n_message(
-        &self,
-        conversation: &String,
-        n: u32,
-    ) -> Result<Vec<String>, Error> {
+    /**
+     * Rewind the conversation to the last n messages.
+     * Returns a vector of messages and the last change block.
+     */
+    pub async fn rewind(&self, conversation: &String, n: u32) -> Result<MessageRewind, Error> {
         let mut n = n;
-        let mut result_vec = Vec::new();
         let conversation_id = to_conversation_id(conversation).unwrap();
         let last_change_result: Result<U256, _> =
             self.contract.last_message(conversation_id).call().await;
@@ -108,36 +106,37 @@ impl MessageSender {
             tracing::error!("last change error: {:?}", err);
             return Err(anyhow::anyhow!("failed to get last change"));
         }
-        while let Ok(prev_block) = last_change_result {
-            let prev_change = U64::from(prev_block.as_u64());
-            if prev_change == U64::zero() {
-                tracing::info!("{} messages found", result_vec.len());
-                break;
-            }
-            tracing::debug!("prev_change: {prev_change}");
+        let mut rewind = MessageRewind {
+            message: Vec::new(),
+            last_change: U256::zero(),
+        };
+        let mut last_change = last_change_result.unwrap();
+        rewind.last_change = last_change;
+        while last_change != U256::zero() {
+            tracing::debug!("prev_change: {}", last_change);
             let conversation_topic = [H256::from(conversation_id)];
             let contract_addr = SENDER_CONTRACT.parse::<Address>().unwrap();
             let filter = Filter::new()
-                .from_block(prev_change)
-                .to_block(prev_change)
+                .from_block(U64::from(last_change.as_u64()))
+                .to_block(U64::from(last_change.as_u64()))
                 .event("PayloadSent(bytes32,bytes,uint256)")
                 .address(vec![contract_addr])
                 .topic1(conversation_topic.to_vec());
-
-            let logs = self.signer.get_logs(&filter).await;
+            let logs = self.client.get_logs(&filter).await;
             if let Ok(logs) = logs {
                 for log in logs.iter() {
-                    if tracing::level_enabled!(tracing::Level::TRACE) {                    
+                    if tracing::level_enabled!(tracing::Level::TRACE) {
                         tracing::trace!("log: {:?}", log);
                     }
                     let param_result = decode_payload_sent(log.data.to_vec());
                     if let Ok(param) = param_result {
                         tracing::debug!("param: {:?}", param);
                         let message = param[0].clone().into_string().unwrap();
-                        tracing::trace!("message: {message}");
-                        result_vec.push(message);
-                        let logged_prev_change = param[1].clone().into_uint().unwrap();
-                        last_change_result = Ok(logged_prev_change);
+                        if tracing::level_enabled!(tracing::Level::TRACE) {
+                            tracing::trace!("message: {message}");
+                        }
+                        rewind.message.push(message);
+                        last_change = param[1].clone().into_uint().unwrap();
                     } else {
                         let err = param_result.unwrap_err();
                         tracing::error!("param error: {:?}", err);
@@ -146,40 +145,35 @@ impl MessageSender {
 
                     n -= 1;
                     if n == 0 {
-                        last_change_result = Ok(U256::zero());
+                        last_change = U256::zero();
                         break;
                     }
                 }
             }
         }
 
-        result_vec.reverse();
-        Ok(result_vec)
+        rewind.message.reverse();
+        tracing::info!("{} messages found", rewind.message.len());
+        Ok(rewind)
     }
 
     pub async fn follow_messages(
         &self,
         conversation: &String,
+        start_block: &U256,
         callback: MessageCallback,
     ) -> Result<(), Error> {
         let conversation_id = to_conversation_id(conversation).unwrap();
         tracing::info!("conversation_id: {}", hex::encode(conversation_id));
         let conversation_topic = [H256::from(conversation_id)];
         let contract_addr = SENDER_CONTRACT.parse::<Address>().unwrap();
-        let mut last_change_result: Result<U256, _> =
-            self.contract.last_message(conversation_id).call().await;
-        if let Err(err) = last_change_result {
-            tracing::error!("last change error: {:?}", err);
-            return Err(anyhow::anyhow!("failed to get last change"));
-        }
-        let last_change = U64::from(last_change_result.unwrap().as_u64());
         let filter = Filter::new()
-            .from_block(last_change)
+            .from_block(U64::from(start_block.as_u64()))
             .event("PayloadSent(bytes32,bytes,uint256)")
             .address(vec![contract_addr])
             .topic1(conversation_topic.to_vec());
 
-        let mut stream = self.signer.subscribe_logs(&filter).await.unwrap();
+        let mut stream = self.client.subscribe_logs(&filter).await.unwrap();
         while let Some(log) = stream.next().await {
             if tracing::level_enabled!(tracing::Level::TRACE) {
                 tracing::trace!("log: {:?}", log);

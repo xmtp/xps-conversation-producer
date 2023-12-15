@@ -14,17 +14,17 @@ async fn main() -> Result<(), Error> {
     printenv(&env);
     let message_sender = MessageSender::new(env.rpc_url, env.private_key).await?;
 
-    let message = message_sender
-        .last_n_message(&env.conversation_id, min(env.message_count, 1000))
+    let rewind = message_sender
+        .rewind(&env.conversation_id, min(env.message_count, 1000))
         .await?;
-    for (i, message) in message.iter().enumerate() {
+    for (i, message) in rewind.message.iter().enumerate() {
         tracing::info!("Message {}: {}", i, message);
     }
 
     let callback = |s: &String| tracing::info!("Message: {}", s);
-    let result = message_sender
-        .follow_messages(&env.conversation_id, callback)
-        .await;
+    message_sender
+        .follow_messages(&env.conversation_id, &rewind.last_change, callback)
+        .await?;
 
     Ok(())
 }
