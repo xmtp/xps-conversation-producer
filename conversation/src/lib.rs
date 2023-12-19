@@ -17,8 +17,11 @@ type WalletType = Wallet<SigningKey>;
 type Client = SignerMiddleware<Provider<Ws>, WalletType>;
 type MessageCallback = fn(&String);
 
+/// gas limit for transactions
 pub const GAS_LIMIT: u64 = 250_000u64;
+/// minimum number of confirmations for transactions
 pub const REQUIRED_CONFIRMATIONS: usize = 1;
+/// XPS MessageSender contract address
 pub const SENDER_CONTRACT: &str = "0x15aE865d0645816d8EEAB0b7496fdd24227d1801";
 
 // Generate rust bindings for the DIDRegistry contract
@@ -28,19 +31,24 @@ abigen!(
     derives(serde::Deserialize, serde::Serialize)
 );
 
-/// Rewind: A struct to hold the message and the last change block.
+/// A struct to hold the message and the last change block.
 pub struct MessageRewind {
     pub message: Vec<String>,
     pub last_change: U256,
 }
 
-/// MessageSender: A struct to send messages to the XPS Sender contract.
+/// A struct to send messages to the XPS Sender contract.
 pub struct MessageSender {
     contract: XPSSender<Client>,
     client: Arc<Client>,
 }
 
 impl MessageSender {
+    /**
+     * Create a new MessageSender.
+     * rpc_url: the RPC URL for the chain
+     * wallet_signer: the private key for the wallet
+     */
     pub async fn new(rpc_url: String, wallet_signer: String) -> Result<MessageSender, Error> {
         let sender_address = SENDER_CONTRACT;
 
@@ -68,6 +76,12 @@ impl MessageSender {
         }
     }
 
+    /**
+     * Send a message to the XPS Sender contract.
+     * conversation: the conversation ID
+     * message: the message to send
+     * Returns Ok(()) if the transaction was successful.
+     */
     pub async fn send_message(&self, conversation: &String, message: &String) -> Result<(), Error> {
         let conversation_id_result = to_conversation_id(conversation);
         if let Err(err) = conversation_id_result {
@@ -94,7 +108,7 @@ impl MessageSender {
 
     /**
      * Rewind the conversation to the last n messages.
-     * Returns a vector of messages and the last change block.
+     * Returns Ok(MessageRewind) a struct containing messages and the last change block.
      */
     pub async fn rewind(&self, conversation: &String, n: u32) -> Result<MessageRewind, Error> {
         let mut n = n;
@@ -128,7 +142,7 @@ impl MessageSender {
                     if tracing::level_enabled!(tracing::Level::TRACE) {
                         tracing::trace!("log: {:?}", log);
                     }
-                    let param_result = decode_payload_sent(log.data.to_vec());
+                    let param_result = abi_decode_payload_sent(log.data.to_vec());
                     if let Ok(param) = param_result {
                         tracing::debug!("param: {:?}", param);
                         let message = param[0].clone().into_string().unwrap();
@@ -157,6 +171,13 @@ impl MessageSender {
         Ok(rewind)
     }
 
+    /**
+     * Follow the conversation and call the callback function for each new message.
+     * conversation: the conversation ID
+     * start_block: the block to start following from
+     * callback: the callback function to call for each new message
+     * Returns Ok(()) if the transaction was successful.
+     */
     pub async fn follow_messages(
         &self,
         conversation: &String,
@@ -178,7 +199,7 @@ impl MessageSender {
             if tracing::level_enabled!(tracing::Level::TRACE) {
                 tracing::trace!("log: {:?}", log);
             }
-            let param_result = decode_payload_sent(log.data.to_vec());
+            let param_result = abi_decode_payload_sent(log.data.to_vec());
             if let Ok(param) = param_result {
                 tracing::debug!("param: {:?}", param);
                 let message = param[0].clone().into_string().unwrap();
@@ -194,11 +215,21 @@ impl MessageSender {
     }
 }
 
+/*
+ * Create a wallet from a private key.
+ * wallet_key: the private key
+ * Returns Ok(WalletType) if the wallet was created successfully.
+ */
 fn wallet_from_key(wallet_key: &str) -> Result<WalletType, Error> {
     let wallet = wallet_key.parse::<LocalWallet>()?;
     Ok(wallet)
 }
 
+/*
+ * Create a conversation ID from a conversation string.
+ * conversation: the conversation string
+ * Returns Ok([u8; 32]) if the conversation ID was created successfully.
+ */
 fn to_conversation_id(conversation: &String) -> Result<[u8; 32], Error> {
     let mut hasher = Sha3_256::default();
     hasher.update(conversation.as_bytes());
@@ -211,7 +242,12 @@ fn to_conversation_id(conversation: &String) -> Result<[u8; 32], Error> {
     Ok(conversation_id)
 }
 
-fn decode_payload_sent(data: Vec<u8>) -> Result<Vec<Token>, Error> {
+/*
+ * Decode the payload sent event.
+ * data: the event data
+ * Returns Ok(Vec<Token>) if the event was decoded successfully.
+ */
+fn abi_decode_payload_sent(data: Vec<u8>) -> Result<Vec<Token>, Error> {
     let param = [ethabi::ParamType::String, ethabi::ParamType::Uint(256)];
     let decoded = ethabi::decode(&param, &data)?;
     Ok(decoded)
