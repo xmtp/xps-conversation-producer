@@ -12,6 +12,10 @@ permissions:
   pages: write
   id-token: write
 
+environment:
+  name: github-pages
+  url: ${{ steps.deployment.outputs.page_url }}
+
 # Allow one concurrent deployment
 concurrency:
   group: "github-pages"
@@ -56,6 +60,7 @@ jobs:
         run: |
           rm -rf ./_site
           cargo doc --lib --no-deps
+          rm -f target/doc/.lock
           cp -r target/doc _site
           echo "<meta http-equiv=\"refresh\" content=\"0; url=conversation\">" > _site/index.html
         id: docgen
